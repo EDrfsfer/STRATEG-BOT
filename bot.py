@@ -11,6 +11,7 @@ from discord.ext import commands
 from threading import Thread
 from flask import Flask, jsonify
 from dotenv import load_dotenv
+import asyncio
 
 app = Flask(__name__)
 
@@ -1387,148 +1388,140 @@ async def chat(
         )
         logger.info(f"Chat desbloqueado por {interaction.user}")
 
-@bot.tree.command(name="anunciar", description="[ADMIN] Envia um anúncio")
+async def canal_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete para listar canais disponíveis"""
+    if not interaction.guild:
+        return []
+    
+    # Filtra canais por nome (case-insensitive)
+    choices = [
+        app_commands.Choice(name=channel.name, value=str(channel.id))
+        for channel in interaction.guild.text_channels
+        if current.lower() in channel.name.lower()
+    ]
+    
+    return choices[:25]  # Discord limita a 25 opções
+
+@bot.tree.command(name="anunciar", description="[ADMIN] Envia um anúncio com anexos")
+@app_commands.guild_only()
 @app_commands.describe(
-    canal="Canal onde enviar o anúncio",
-    mensagem="Mensagem do anúncio",
-    embed="Enviar como embed?",
-    titulo="Título do embed (se embed=True)",
-    cor="Cor do embed (nome ou hex)",
+    mensagem="Mensagem do anúncio (quebra de linha = \\n)",
+    canal="Canal onde enviar (opcional - usa canal atual se não especificado)",
+    embed="Enviar como embed? (True/False)",
+    cor="Cor do embed (nome ou hex, ex: red, #FF0000)",
     imagem="Imagem ou vídeo opcional"
 )
+@app_commands.autocomplete(canal=canal_autocomplete)
 async def anunciar(
     interaction: discord.Interaction,
-    canal: discord.TextChannel,
     mensagem: str,
-    embed: bool = False,
-    titulo: Optional[str] = None,
+    canal: Optional[str] = None,
+    embed: Optional[bool] = False,
     cor: Optional[str] = None,
     imagem: Optional[discord.Attachment] = None
 ):
+    """Comando completo para anúncios"""
+    
     if not is_admin_or_moderator(interaction):
         await interaction.response.send_message(
             "❌ Você não tem permissão para usar este comando.",
             ephemeral=True
         )
         return
-
+    
     try:
         await interaction.response.defer(ephemeral=True)
         
+        # Converte quebras de linha
+        mensagem_formatada = mensagem.replace("\\n", "\n")
+        
+        # Se não especificar canal, usa o atual
+        target_canal = interaction.channel
+        if canal:
+            try:
+                target_canal = interaction.guild.get_channel(int(canal))
+                if not target_canal:
+                    await interaction.followup.send(
+                        "❌ Canal não encontrado!",
+                        ephemeral=True
+                    )
+                    return
+            except Exception:
+                pass
+        
+        # Preparar arquivo se houver
         files = []
         if imagem:
             file = await imagem.to_file()
             files.append(file)
         
+        # Montar a mensagem
         if embed:
-            embed_color = utils.parse_color(cor) if cor else discord.Color.blue()
-            embed_obj = discord.Embed(
-                title=titulo or "Anúncio",
-                description=mensagem,
+            # Criar embed
+            embed_color = discord.Color.blue()
+            
+            # Tentar parsear cor
+            if cor:
+                try:
+                    if cor.startswith("#"):
+                        embed_color = discord.Color(int(cor.replace("#", ""), 16))
+                    else:
+                        # Cores nomeadas
+                        cores = {
+                            "red": discord.Color.red(),
+                            "green": discord.Color.green(),
+                            "blue": discord.Color.blue(),
+                            "yellow": discord.Color.yellow(),
+                            "purple": discord.Color.purple(),
+                            "orange": discord.Color.orange(),
+                            "pink": discord.Color.magenta(),
+                            "gold": discord.Color.gold(),
+                        }
+                        embed_color = cores.get(cor.lower(), discord.Color.blue())
+                except Exception:
+                    embed_color = discord.Color.blue()
+            
+            embed_msg = discord.Embed(
+                description=mensagem_formatada,
                 color=embed_color
             )
             
             if imagem and imagem.content_type.startswith("image"):
-                embed_obj.set_image(url=f"attachment://{imagem.filename}")
+                embed_msg.set_image(url=f"attachment://{imagem.filename}")
             
-            await canal.send(embed=embed_obj, files=files if files else None)
-        else:
             if files:
-                await canal.send(content=mensagem, files=files)
+                await target_canal.send(embed=embed_msg, files=files)
             else:
-                await canal.send(content=mensagem)
+                await target_canal.send(embed=embed_msg)
+        else:
+            # Mensagem simples
+            if files:
+                await target_canal.send(mensagem_formatada, files=files)
+            else:
+                await target_canal.send(mensagem_formatada)
         
         await interaction.followup.send(
-            f"✅ Anúncio enviado em {canal.mention}!",
+            f"✅ Anúncio enviado em {target_canal.mention}!",
             ephemeral=True
         )
         
-        logger.info(f"Anúncio enviado em {canal.name} por {interaction.user}")
+        logger.info(f"Anúncio enviado por {interaction.user} em {target_canal.name}")
         
     except Exception as e:
-        logger.error(f"Erro ao enviar anúncio: {e}", exc_info=True)
+        logger.error(f"Erro no comando anunciar: {e}", exc_info=True)
         await interaction.followup.send(
             f"❌ Erro ao enviar anúncio: {str(e)}",
             ephemeral=True
         )
 
-@bot.tree.command(name="controle_acesso", description="[ADMIN] Gerencia acesso de moderadores ao bot")
-@app_commands.describe(
-    acao="Ação a realizar",
-    usuario="Usuário a adicionar/remover"
-)
-async def controle_acesso(
-    interaction: discord.Interaction,
-    acao: Literal["adicionar", "remover", "lista"],
-    usuario: Optional[discord.User] = None
-):
-    if not is_admin_or_moderator(interaction):
-        await interaction.response.send_message(
-            "❌ Você não tem permissão para usar este comando.",
-            ephemeral=True
-        )
-        return
-    
-    if acao == "lista":
-        moderators = db.get_moderators()
-        
-        if not moderators:
-            await interaction.response.send_message(
-                "📋 Nenhum moderador configurado.",
-                ephemeral=True
-            )
-            return
-        
-        embed = discord.Embed(
-            title="👮 Moderadores do Bot",
-            color=discord.Color.blue()
-        )
-        
-        mod_list = []
-        for mod_id in moderators:
-            try:
-                user = await bot.fetch_user(int(mod_id))
-                mod_list.append(f"• {user.mention} ({user.name})")
-            except:
-                mod_list.append(f"• ID: {mod_id} (usuário não encontrado)")
-        
-        embed.description = "\n".join(mod_list)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    if not usuario:
-        await interaction.response.send_message(
-            "❌ Você precisa especificar um usuário!",
-            ephemeral=True
-        )
-        return
-    
-    if acao == "adicionar":
-        db.add_moderator(usuario.id)
-        await interaction.response.send_message(
-            f"✅ {usuario.mention} agora tem controle total do bot!",
-            ephemeral=True
-        )
-        logger.info(f"Moderador adicionado: {usuario} por {interaction.user}")
-    
-    elif acao == "remover":
-        if db.remove_moderator(usuario.id):
-            await interaction.response.send_message(
-                f"✅ {usuario.mention} foi removido dos moderadores!",
-                ephemeral=True
-            )
-            logger.info(f"Moderador removido: {usuario} por {interaction.user}")
-        else:
-            await interaction.response.send_message(
-                f"❌ {usuario.mention} não é um moderador.",
-                ephemeral=True
-            )
-
-# Modifique o comando tag_manual removendo a verificação de inscrição
 @bot.tree.command(name="tag_manual", description="[ADMIN] Concede TAG manual a um usuário")
+@app_commands.guild_only()
 @app_commands.describe(
     usuario="Usuário que receberá a TAG",
-    quantidade="Quantidade de fichas extras da TAG (padrão: 1)"
+    quantidade="Quantidade de fichas (padrão: 1)"
 )
 async def tag_manual(
     interaction: discord.Interaction,
@@ -1542,35 +1535,38 @@ async def tag_manual(
         )
         return
     
-    if quantidade < 0:
+    if quantidade <= 0:
         await interaction.response.send_message(
-            "❌ A quantidade não pode ser negativa!",
+            "❌ A quantidade deve ser maior que 0!",
             ephemeral=True
         )
         return
     
-    # Define/Remove a TAG manual
-    if quantidade == 0:
-        db.remove_manual_tag(usuario.id)
+    if not db.is_registered(usuario.id):
         await interaction.response.send_message(
-            f"✅ TAG removida de {usuario.mention}!",
+            f"❌ {usuario.mention} não está inscrito no sorteio!",
             ephemeral=True
         )
-        logger.info(f"TAG manual removida de {usuario} por {interaction.user}")
-    else:
-        db.set_manual_tag(usuario.id, quantidade)
+        return
+    
+    try:
+        db.add_manual_tag(usuario.id, quantidade)
+        
         await interaction.response.send_message(
-            f"✅ TAG concedida!\n"
-            f"**Usuário**: {usuario.mention}\n"
-            f"**Fichas da TAG**: {quantidade}",
+            f"✅ {usuario.mention} recebeu +{quantidade} TAG manual!",
             ephemeral=True
         )
-        logger.info(f"TAG manual ({quantidade} fichas) concedida a {usuario} por {interaction.user}")
+        logger.info(f"TAG manual de {quantidade} concedida a {usuario} por {interaction.user}")
+    except Exception as e:
+        logger.error(f"Erro ao conceder TAG manual: {e}", exc_info=True)
+        await interaction.response.send_message(
+            f"❌ Erro ao conceder TAG: {str(e)}",
+            ephemeral=True
+        )
 
-@bot.tree.command(name="sync", description="[ADMIN] Sincroniza comandos do bot")
-@app_commands.describe(guild_id="ID do servidor (opcional, vazio para global)")
-async def sync(interaction: discord.Interaction, guild_id: Optional[str] = None):
-    if not is_admin_or_moderator(interaction):
+@bot.tree.command(name="sync", description="[ADMIN] Sincroniza comandos com Discord")
+async def sync(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
             "❌ Você não tem permissão para usar este comando.",
             ephemeral=True
@@ -1580,80 +1576,31 @@ async def sync(interaction: discord.Interaction, guild_id: Optional[str] = None)
     await interaction.response.defer(ephemeral=True)
     
     try:
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
-            synced = await bot.tree.sync(guild=guild)
-            await interaction.followup.send(
-                f"✅ Sincronizados {len(synced)} comandos no servidor {guild_id}",
-                ephemeral=True
-            )
-        else:
-            synced = await bot.tree.sync()
-            await interaction.followup.send(
-                f"✅ Sincronizados {len(synced)} comandos globalmente",
-                ephemeral=True
-            )
-        
-        logger.info(f"Comandos sincronizados por {interaction.user}")
-        
+        synced = await bot.tree.sync()
+        await interaction.followup.send(
+            f"✅ Sincronizados {len(synced)} comandos com sucesso!",
+            ephemeral=True
+        )
+        logger.info(f"Comandos sincronizados por {interaction.user} ({len(synced)} comandos)")
     except Exception as e:
-        logger.error(f"Erro ao sincronizar: {e}", exc_info=True)
+        logger.error(f"Erro ao sincronizar comandos: {e}", exc_info=True)
         await interaction.followup.send(
             f"❌ Erro ao sincronizar: {str(e)}",
             ephemeral=True
         )
 
-def format_tickets_list(tickets: dict, guild: discord.Guild) -> list:
-    lines = []
-    
-    # Ficha base
-    lines.append("• 1 ficha base")
-    
-    # Fichas de cargos
-    if "roles" in tickets and tickets["roles"]:
-        for role_id, info in tickets["roles"].items():
-            role = guild.get_role(int(role_id))
-            role_name = role.name if role else "Cargo Desconhecido"
-            lines.append(f"• +{info['quantity']} ficha(s) do cargo {role_name} ({info['abbreviation']})")
-    
-    # TAG automática
-    if tickets.get("tag", 0) > 0:
-        lines.append(f"• +{tickets['tag']} ficha(s) da TAG")
-    
-    # TAG manual (novo)
-    if tickets.get("manual_tag", 0) > 0:
-        lines.append(f"• +{tickets['manual_tag']} ficha(s) da TAG manual")
-    
-    return lines
-
-def get_total_tickets(tickets: dict) -> int:
-    total = 1  # ficha base
-    
-    # Soma fichas de cargos
-    if "roles" in tickets:
-        total += sum(role["quantity"] for role in tickets["roles"].values())
-    
-    # Soma TAG automática
-    total += tickets.get("tag", 0)
-    
-    # Soma TAG manual (novo)
-    total += tickets.get("manual_tag", 0)
-    
-    return total
-
-@bot.tree.command(name="adicionar_participante", description="[ADMIN] Adiciona manualmente um participante à lista")
+@bot.tree.command(name="adicionar_participante", description="[ADMIN] Adiciona um participante manualmente")
+@app_commands.guild_only()
 @app_commands.describe(
-    usuario="Usuário a ser adicionado",
+    usuario="Usuário a adicionar",
     primeiro_nome="Primeiro nome do participante",
-    sobrenome="Sobrenome do participante",
-    hashtag="Hashtag obrigatória"
+    sobrenome="Sobrenome do participante"
 )
 async def adicionar_participante(
     interaction: discord.Interaction,
     usuario: discord.User,
     primeiro_nome: str,
-    sobrenome: str,
-    hashtag: str
+    sobrenome: str
 ):
     if not is_admin_or_moderator(interaction):
         await interaction.response.send_message(
@@ -1665,6 +1612,7 @@ async def adicionar_participante(
     try:
         await interaction.response.defer(ephemeral=True)
         
+        # Valida se o usuário está na blacklist
         if db.is_blacklisted(usuario.id):
             await interaction.followup.send(
                 "❌ Este usuário está na blacklist e não pode ser adicionado.",
@@ -1672,37 +1620,38 @@ async def adicionar_participante(
             )
             return
         
-        first_name = primeiro_nome.strip()
-        last_name = sobrenome.strip()
-        hashtag_input = hashtag.strip()
+        # Valida se já está inscrito
+        if db.is_registered(usuario.id):
+            await interaction.followup.send(
+                "❌ Este usuário já está inscrito no sorteio!",
+                ephemeral=True
+            )
+            return
         
-        valid, error_msg = utils.validate_full_name(first_name, last_name)
+        # Valida nome
+        valid, error_msg = utils.validate_full_name(primeiro_nome, sobrenome)
         if not valid:
             await interaction.followup.send(error_msg, ephemeral=True)
             return
         
-        if db.is_name_taken(first_name, last_name):
+        # Valida se o nome já foi utilizado
+        if db.is_name_taken(primeiro_nome, sobrenome):
             await interaction.followup.send(
                 "❌ Este nome já foi registrado por outro participante.",
                 ephemeral=True
             )
             return
         
+        # Pega a hashtag configurada (automaticamente)
         required_hashtag = db.get_hashtag()
         if not required_hashtag:
             await interaction.followup.send(
-                "⚠️ Nenhuma hashtag foi configurada ainda. Contate um administrador.",
+                "⚠️ Nenhuma hashtag foi configurada. Contate um administrador.",
                 ephemeral=True
             )
             return
         
-        if hashtag_input.lower() != required_hashtag.lower():
-            await interaction.followup.send(
-                f"❌ Hashtag incorreta! A hashtag correta é: `{required_hashtag}`",
-                ephemeral=True
-            )
-            return
-        
+        # Pega dados para calcular fichas
         inscricao_channel_id = db.get_inscricao_channel()
         if not inscricao_channel_id:
             await interaction.followup.send(
@@ -1719,14 +1668,14 @@ async def adicionar_participante(
             )
             return
         
+        # Calcula as fichas baseado nos cargos e TAG
         bonus_roles = db.get_bonus_roles()
         tag_config = db.get_tag()
         
-        # Aqui pega o membro correto!
         member = interaction.guild.get_member(usuario.id)
         if not member:
             await interaction.followup.send(
-                "❌ Não foi possível encontrar o usuário no servidor.",
+                "❌ Usuário não encontrado no servidor!",
                 ephemeral=True
             )
             return
@@ -1741,39 +1690,43 @@ async def adicionar_participante(
         
         total_tickets = utils.get_total_tickets(tickets)
         
-        msg_content = f"{member.mention}\n{first_name} {last_name}\n{required_hashtag}"
-        
+        # Envia mensagem no canal de inscrições
+        msg_content = f"{member.mention}\n{primeiro_nome} {sobrenome}\n{required_hashtag}"
         msg = await inscricao_channel.send(msg_content)
-        await msg.add_reaction("✅")  # Adiciona reação de verificado
-            
+        await msg.add_reaction("✅")
+        
+        # Adiciona ao banco de dados
         db.add_participant(
             usuario.id,
-            first_name,
-            last_name,
+            primeiro_nome,
+            sobrenome,
             tickets,
             msg.id
         )
         
-        logger.info(f"Nova inscrição manual: {first_name} {last_name} ({usuario.id}) - {total_tickets} fichas")
-        
         await interaction.followup.send(
-            f"✅ Participante adicionado: {member.mention} ({first_name} {last_name})",
+            f"✅ Participante adicionado com sucesso!\n"
+            f"**Nome**: {primeiro_nome} {sobrenome}\n"
+            f"**Fichas**: {total_tickets}",
             ephemeral=True
         )
         
+        logger.info(f"Participante adicionado manualmente: {primeiro_nome} {sobrenome} ({usuario.id}) - {total_tickets} fichas por {interaction.user}")
+    
     except Exception as e:
         logger.error(f"Erro ao adicionar participante manualmente: {e}", exc_info=True)
         await interaction.followup.send(
-            "❌ Ocorreu um erro ao adicionar o participante. Tente novamente.",
+            f"❌ Erro ao adicionar participante: {str(e)}",
             ephemeral=True
         )
 
+# Inicia threads Flask
 if __name__ == "__main__":
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN não encontrado nas variáveis de ambiente")
-        exit(1)
-
-    # Inicia o Flask em uma thread separada
-    Thread(target=run_flask, daemon=True).start()
-    bot.run(BOT_TOKEN)
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask iniciado em thread separada")
+    
+    try:
+        bot.run(os.getenv("BOT_TOKEN"))
+    except Exception as e:
+        logger.error(f"Erro ao iniciar bot: {e}")
